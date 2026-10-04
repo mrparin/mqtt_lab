@@ -16,7 +16,7 @@ const char* topic_ack = "farm1/zoneA/dev01/ack";
 
 #define DHTPIN 15
 #define DHTTYPE DHT22
-#define RELAY_PIN 5
+#define RELAY_PIN 5 // GPIO pin for relay control เปลียนเป็นGPIO 19 ตามวงจร
 
 DHT dht(DHTPIN, DHTTYPE);
 WiFiClient espClient;
