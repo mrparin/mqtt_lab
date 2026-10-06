@@ -6,15 +6,12 @@
 #include <DHT.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <atomic>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
 
 // ================= ตั้งค่าฮาร์ดแวร์ =================
 #define DHTPIN 15
 #define DHTTYPE DHT22
 #define RELAY_PIN 5
-#define RESET_PIN 0 // ใช้ปุ่ม BOOT บนบอร์ด ESP32
+#define WIFI_CONFIG_PIN 27 // Normally-open switch: GPIO27 to GND
 
 DHT dht(DHTPIN, DHTTYPE);
 WiFiClient espClient;
@@ -38,44 +35,13 @@ bool relayState = false;
 float currentTemp = 0.0;
 float currentHum = 0.0;
 
-std::atomic<bool> bootPressed{false};
-std::atomic<bool> resetArmed{false};
-std::atomic<bool> resetRequested{false};
-
-// Sample independently of blocking WiFi/MQTT calls. Only the main task
-// accesses WiFiManager, MQTT and LCD; this task records button events.
-void monitorBootButton(void*) {
-  bool lastRaw = false;
-  bool stablePressed = false;
-  unsigned long changedAt = millis();
-  unsigned long pressedAt = 0;
-  for (;;) {
-    const unsigned long now = millis();
-    const bool raw = digitalRead(RESET_PIN) == LOW;
-    if (raw != lastRaw) {
-      lastRaw = raw;
-      changedAt = now;
-    }
-    if (raw != stablePressed && now - changedAt >= 30) {
-      stablePressed = raw;
-      bootPressed.store(raw);
-      if (raw) {
-        pressedAt = now;
-        Serial.println("BOOT pressed. Hold for 3 seconds...");
-      } else if (resetArmed.load()) {
-        resetRequested.store(true);
-        Serial.println("BOOT released. WiFi reset requested.");
-      } else {
-        Serial.println("BOOT released too soon. Reset cancelled.");
-      }
-    }
-    if (stablePressed && !resetArmed.load() && now - pressedAt >= 3000) {
-      resetArmed.store(true);
-      Serial.println("BOOT held for 3 seconds. Release BOOT to reset WiFi.");
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-}
+WiFiManager wm;
+WiFiManagerParameter custom_mqtt_server("server", "MQTT Server IP", mqtt_server, sizeof(mqtt_server) - 1);
+WiFiManagerParameter custom_farm("farm", "Farm Name", farm_name, sizeof(farm_name) - 1);
+WiFiManagerParameter custom_zone("zone", "Zone Name", zone_name, sizeof(zone_name) - 1);
+WiFiManagerParameter custom_device("dev", "Device ID", device_id, sizeof(device_id) - 1);
+bool configSaved = false;
+const unsigned long SWITCH_DEBOUNCE_MS = 30;
 
 // Persist custom fields separately from WiFi credentials.
 void loadConfig() {
@@ -105,38 +71,40 @@ void saveConfig() {
   prefs.end();
 }
 
-// Restart only after release, so GPIO0 is HIGH at the next boot.
-void checkResetButton() {
-  static bool shown = false;
-  if (resetArmed.load() && !shown) {
-    shown = true;
-    lcd.clear();
-    lcd.print("Release BOOT");
-    lcd.setCursor(0, 1);
-    lcd.print("to reset WiFi");
+void checkConfigSwitch() {
+  // static ทำให้จำค่าเดิมได้ แม้ฟังก์ชันจะจบและถูกเรียกใหม่ในรอบถัดไป
+  static bool lastReading = HIGH;
+  static bool stableState = HIGH;
+  static unsigned long changedAt = 0;
+  const unsigned long now = millis();
+  const bool reading = digitalRead(WIFI_CONFIG_PIN);
+
+  // สวิตช์อาจเด้ง HIGH/LOW หลายครั้งเมื่อกด จึงเริ่มจับเวลาใหม่ทุกครั้งที่ค่าเปลี่ยน
+  if (reading != lastReading) {
+    lastReading = reading;
+    changedAt = now;
   }
-  if (!resetRequested.load() || bootPressed.load() || digitalRead(RESET_PIN) == LOW) return;
+
+  // ยังไม่นิ่งครบ 30 ms ให้กลับไปทำงานอื่น ไม่ต้องหยุดรอด้วย delay()
+  if (now - changedAt < SWITCH_DEBOUNCE_MS) return;
+  if (reading == stableState) return;
+
+  // ยอมรับสถานะใหม่เมื่อค่าคงที่ครบเวลา เปิด Portal เฉพาะตอนเปลี่ยนเป็น LOW
+  stableState = reading;
+  if (stableState != LOW || wm.getConfigPortalActive()) return;
   digitalWrite(RELAY_PIN, LOW);
   relayState = false;
   if (client.connected()) {
     client.publish(topic_status.c_str(), "{\"status\":\"offline\"}", true);
     client.disconnect();
   }
-  lcd.clear();
-  lcd.print("Resetting WiFi...");
-  Serial.println("BOOT released. Clearing WiFi settings and restarting...");
-  WiFiManager wm;
-  wm.resetSettings(); // Custom fields in Preferences are preserved.
-  // Check again after clearing settings in case BOOT was pressed again.
-  while (digitalRead(RESET_PIN) == LOW) delay(10);
-  delay(50);
-  if (digitalRead(RESET_PIN) == LOW) return;
-  ESP.restart();
+  Serial.println("Switch pressed. Opening WiFi configuration portal...");
+  wm.startConfigPortal("ESP32_SmartFarm");
 }
 
 // ================= ฟังก์ชันอัปเดตหน้าจอ =================
 void updateDisplay() {
-  if (resetArmed.load()) return;
+  if (wm.getConfigPortalActive()) return;
   lcd.setCursor(0, 0);
   lcd.print("IP: "); 
   lcd.print(WiFi.localIP());
@@ -202,7 +170,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
 void reconnect() {
   static unsigned long lastAttempt = 0;
   static bool attempted = false;
-  if (bootPressed.load() || resetRequested.load()) return;
+  if (wm.getConfigPortalActive()) return;
   if (WiFi.status() != WL_CONNECTED) return;
   if (attempted && millis() - lastAttempt < 5000) return;
   attempted = true;
@@ -226,15 +194,13 @@ void reconnect() {
 }
 
 // ================= ฟังก์ชันตั้งค่า =================
+void applyConfig();
+
 void setup() {
   Serial.begin(115200);
-  pinMode(RESET_PIN, INPUT_PULLUP);
-  Serial.println("Firmware: BOOT WiFi reset v2 (hold 3s, then release)");
-  if (xTaskCreate(monitorBootButton, "boot-button", 2048, nullptr, 2, nullptr) != pdPASS) {
-    Serial.println("ERROR: Cannot start BOOT button monitor.");
-    while (true) delay(1000);
-  }
-  
+  pinMode(WIFI_CONFIG_PIN, INPUT_PULLUP);
+  Serial.println("Firmware: external switch WiFi portal (GPIO27 to GND)");
+
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
@@ -246,8 +212,11 @@ void setup() {
   digitalWrite(RELAY_PIN, LOW);
   dht.begin();
 
-  WiFiManager wm;
   loadConfig();
+  custom_mqtt_server.setValue(mqtt_server, sizeof(mqtt_server) - 1);
+  custom_farm.setValue(farm_name, sizeof(farm_name) - 1);
+  custom_zone.setValue(zone_name, sizeof(zone_name) - 1);
+  custom_device.setValue(device_id, sizeof(device_id) - 1);
   wm.setConnectTimeout(20);
   wm.setConfigPortalTimeout(180);
   wm.setConfigPortalBlocking(false);
@@ -258,39 +227,21 @@ void setup() {
     lcd.print("Open 192.168.4.1");
   });
 
-  WiFiManagerParameter custom_mqtt_server("server", "MQTT Server IP", mqtt_server, sizeof(mqtt_server) - 1);
-  WiFiManagerParameter custom_farm("farm", "Farm Name", farm_name, sizeof(farm_name) - 1);
-  WiFiManagerParameter custom_zone("zone", "Zone Name", zone_name, sizeof(zone_name) - 1);
-  WiFiManagerParameter custom_device("dev", "Device ID", device_id, sizeof(device_id) - 1);
-
   wm.addParameter(&custom_mqtt_server);
   wm.addParameter(&custom_farm);
   wm.addParameter(&custom_zone);
   wm.addParameter(&custom_device);
 
-  // เริ่มกระบวนการเชื่อมต่อ หรือเปิด AP 192.168.4.1 หากไม่สำเร็จ
-  bool wifiConnected = wm.autoConnect("ESP32_SmartFarm");
-  while (!wifiConnected && wm.getConfigPortalActive()) {
-    checkResetButton();
-    wm.process();
-    wifiConnected = WiFi.status() == WL_CONNECTED;
-    delay(10);
-  }
-  checkResetButton();
-  if (!wifiConnected) {
-    Serial.println("Failed to connect and hit timeout");
-    const unsigned long failedAt = millis();
-    while (millis() - failedAt < 3000 || bootPressed.load()) {
-      checkResetButton();
-      delay(10);
-    }
-    checkResetButton();
-    ESP.restart();
-  }
+  wm.setSaveParamsCallback([]() { configSaved = true; });
+  wm.autoConnect("ESP32_SmartFarm");
+  applyConfig();
+  client.setCallback(callback);
+  client.setSocketTimeout(3);
+  WiFi.setAutoReconnect(true);
+  updateDisplay();
+}
 
-  lcd.clear();
-  Serial.println("WiFi connected");
-
+void applyConfig() {
   // อ่านค่าที่ผู้ใช้กรอกมาเก็บลงตัวแปร
   const char* server = custom_mqtt_server.getValue();
   if (server[0] != '\0') snprintf(mqtt_server, sizeof(mqtt_server), "%s", server);
@@ -316,15 +267,30 @@ void setup() {
   Serial.println(topic_status);
 
   client.setServer(mqtt_server, 1883);
-  client.setCallback(callback);
-  client.setSocketTimeout(3);
-  WiFi.setAutoReconnect(true);
-  updateDisplay();
+
 }
 
 // ================= ลูปการทำงานหลัก =================
 void loop() {
-  checkResetButton();
+  checkConfigSwitch();
+  const bool portalWasActive = wm.getConfigPortalActive();
+  wm.process();
+  if (configSaved) {
+    configSaved = false;
+    if (client.connected()) {
+      client.publish(topic_status.c_str(), "{\"status\":\"offline\"}", true);
+      client.disconnect();
+    }
+    applyConfig();
+  }
+  if (portalWasActive && !wm.getConfigPortalActive()) {
+    lcd.clear();
+    updateDisplay();
+  }
+  if (wm.getConfigPortalActive()) {
+    delay(10);
+    return;
+  }
   if (!client.connected()) {
     reconnect();
   }
